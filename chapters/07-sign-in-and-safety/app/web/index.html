@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IT helpdesk</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; }
+    main { display: flex; flex-wrap: wrap; gap: 1rem; padding: 1rem; }
+    section { flex: 1 1 22rem; min-width: 0; }
+    #log { list-style: none; padding: 0; }
+    #log li { margin: 0.75rem 0; padding: 0.5rem 0.75rem; border-radius: 0.5rem; white-space: pre-wrap; }
+    #log li.you { background: #e8eefc; }
+    #log li.bot { background: #f1f1f1; }
+    #log li.err { background: #fde8e8; }
+    #signin-error { color: #a00; }
+    #log li.src { background: none; padding: 0 0.75rem; white-space: normal; }
+    textarea, input { width: 100%; box-sizing: border-box; font: inherit; }
+    #signin-box { max-width: 24rem; }
+    button { margin-top: 0.5rem; font: inherit; }
+    #panel h2 { margin-top: 0; font-size: 1rem; }
+    #page { width: 100%; height: 28rem; border: 1px solid #ccc; border-radius: 0.5rem; }
+    #excerpt { font-size: 0.9rem; color: #444; }
+  </style>
+</head>
+<body>
+  <main>
+    <section id="signin-box">
+      <h1>IT helpdesk</h1>
+      <form id="signin">
+        <label for="email">Work email</label>
+        <input id="email" type="email" autocomplete="username" maxlength="254" required>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" maxlength="256" required>
+        <button id="signin-button" type="submit">Sign in</button>
+      </form>
+      <p id="signin-error" role="alert"></p>
+    </section>
+    <section id="chat" hidden>
+      <h1>IT helpdesk</h1>
+      <button id="signout" type="button">Sign out</button>
+      <ul id="log" aria-live="polite"></ul>
+      <form id="form">
+        <label for="question">Ask a question</label>
+        <textarea id="question" rows="3" maxlength="1000" required></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+    </section>
+    <section id="panel" hidden>
+      <h2 id="pagename">Policy page</h2>
+      <p id="excerpt"></p>
+      <iframe id="page" title="Cited policy page" sandbox=""></iframe>
+    </section>
+  </main>
+  <script>
+    // The page and the endpoint share one address: CloudFront sends /ask to the API and
+    // everything else, policy pages included, to the bucket. The reply arrives whole.
+    const signinBox = document.getElementById("signin-box");
+    const signinForm = document.getElementById("signin");
+    const emailBox = document.getElementById("email");
+    const passwordBox = document.getElementById("password");
+    const signinError = document.getElementById("signin-error");
+    const chat = document.getElementById("chat");
+    const log = document.getElementById("log");
+    const form = document.getElementById("form");
+    const box = document.getElementById("question");
+    const send = document.getElementById("send");
+    const panel = document.getElementById("panel");
+    const frame = document.getElementById("page");
+    const pagename = document.getElementById("pagename");
+    const excerpt = document.getElementById("excerpt");
+    // The sign-in token lives in this variable only: never in storage, so closing the tab ends it.
+    let token = null;
+    // Same shape the server accepts; anything else is never put in the frame.
+    const PAGE = /^policies\/[A-Za-z0-9._-]+\.html$/;
+
+    function add(kind, text) {
+      const item = document.createElement("li");
+      item.className = kind;
+      item.textContent = text; // text, never markup: the answer is not trusted
+      log.appendChild(item);
+      return item;
+    }
+
+    function show(source) {
+      if (!PAGE.test(source.page)) return;
+      pagename.textContent = source.page.replace("policies/", "").replace(".html", "");
+      excerpt.textContent = source.excerpt || "";
+      frame.src = "/" + source.page;
+      panel.hidden = false;
+    }
+
+    function addSources(sources) {
+      if (!Array.isArray(sources) || sources.length === 0) return;
+      const item = add("src", "Sources: ");
+      for (const source of sources) {
+        const choice = document.createElement("button");
+        choice.type = "button";
+        choice.textContent = String(source.page).replace("policies/", "").replace(".html", "");
+        choice.addEventListener("click", () => show(source));
+        item.appendChild(choice);
+      }
+      show(sources[0]);
+    }
+
+    function signedOut(message) {
+      token = null;
+      log.replaceChildren(); // the next person at this screen sees none of the last chat
+      chat.hidden = true;
+      panel.hidden = true;
+      signinBox.hidden = false;
+      signinError.textContent = message; // text, never markup
+    }
+
+    signinForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const email = emailBox.value.trim();
+      const password = passwordBox.value;
+      passwordBox.value = ""; // the password is gone from the page as soon as it is sent
+      try {
+        const response = await fetch("/signin", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await response.json();
+        if (response.ok && typeof data.id_token === "string") {
+          token = data.id_token;
+          signinBox.hidden = true;
+          chat.hidden = false;
+          box.focus();
+          signinError.textContent = "";
+        } else signinError.textContent = data.error || "Could not sign in. Try again.";
+      } catch (error) {
+        signinError.textContent = "Could not reach the helpdesk. Try again.";
+      }
+    });
+
+    document.getElementById("signout").addEventListener("click", () => signedOut(""));
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const question = box.value.trim();
+      if (!question) return;
+      add("you", question);
+      box.value = "";
+      send.disabled = true;
+      try {
+        const response = await fetch("/ask", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: "Bearer " + token },
+          body: JSON.stringify({ question }),
+        });
+        const data = await response.json();
+        if (response.status === 401) signedOut("Your sign-in ran out. Sign in again.");
+        else if (response.ok) {
+          add("bot", data.answer);
+          addSources(data.sources);
+        } else add("err", data.error || "Something went wrong. Try again.");
+      } catch (error) {
+        add("err", "Could not reach the helpdesk. Try again.");
+      } finally {
+        send.disabled = false;
+        box.focus();
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+[
+  {
+    "id": "password-reset",
+    "question": "How do I reset my password?",
+    "expect_page": "policies/password-reset.html"
+  },
+  {
+    "id": "vpn-access",
+    "question": "How do I get VPN access?",
+    "expect_page": "policies/vpn-access.html"
+  },
+  {
+    "id": "new-laptop",
+    "question": "How do I ask for a new laptop?",
+    "expect_page": "policies/new-laptop.html"
+  },
+  {
+    "id": "off-topic",
+    "question": "Which stock should I buy this year?",
+    "expect_blocked": true
+  }
+]

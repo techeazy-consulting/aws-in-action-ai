@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Helpdesk assistant, chapter 2. POST /ask sends a question to a hosted model
+  through the Converse API and returns the answer.
+
+Parameters:
+  Project:
+    Type: String
+    Default: helpdesk
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+    Description: Short project name, lowercase. Starts every resource name, for example helpdesk-dev-ask.
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Which copy this stack is. Deploy once per environment, each as its own stack.
+  ModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    AllowedValues:
+      - amazon.nova-lite-v1:0
+      - amazon.nova-micro-v1:0
+    Description: >-
+      The model that answers. Nova Lite works in every Region in the RegionRoute list. Nova Micro has
+      no Asia Pacific route. To switch later, update the stack and pick another value here; editing the
+      function's MODEL_ID alone fails, because the role only allows the model chosen here.
+  ModelRoute:
+    Type: String
+    Default: auto
+    AllowedValues: [auto, direct, us, eu, apac, ca]
+    Description: >-
+      How the call reaches the model. auto picks the route for this Region from RegionRoute. direct
+      calls the model id as it is (only where the model page shows In-Region support); us, eu, apac
+      and ca call that geography's inference profile.
+
+Mappings:
+  # The route each Region uses for Nova Lite, from the model page's Regional availability table.
+  RegionRoute:
+    us-east-1: {Route: us}
+    us-east-2: {Route: us}
+    us-west-1: {Route: us}
+    us-west-2: {Route: us}
+    ca-central-1: {Route: ca}
+    ca-west-1: {Route: ca}
+    eu-central-1: {Route: eu}
+    eu-north-1: {Route: eu}
+    eu-south-1: {Route: eu}
+    eu-south-2: {Route: eu}
+    eu-west-1: {Route: eu}
+    eu-west-2: {Route: direct}
+    eu-west-3: {Route: eu}
+    il-central-1: {Route: eu}
+    ap-northeast-1: {Route: apac}
+    ap-northeast-2: {Route: apac}
+    ap-south-1: {Route: apac}
+    ap-southeast-1: {Route: apac}
+    ap-southeast-2: {Route: apac}
+    ap-southeast-3: {Route: apac}
+    me-central-1: {Route: direct}
+
+Conditions:
+  RouteIsAuto: !Equals [!Ref ModelRoute, auto]
+  CallsModelDirectly: !Or
+    - !Equals [!Ref ModelRoute, direct]
+    - !And
+      - !Condition RouteIsAuto
+      - !Equals [!FindInMap [RegionRoute, !Ref "AWS::Region", Route], direct]
+  CallsInferenceProfile: !Not [!Condition CallsModelDirectly]
+
+Resources:
+  AskFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Project}-${Environment}-ask"
+      RetentionInDays: 7
+      Tags:
+        - Key: chapter
+          Value: session-02
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  AskFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ask-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AskFunctionLogGroup.Arn
+              - Sid: CallTheChosenModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !If
+                  - CallsInferenceProfile
+                  - - !Sub
+                      - "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${Id}"
+                      - Id: !Join [".", [!If [RouteIsAuto, !FindInMap [RegionRoute, !Ref "AWS::Region", Route], !Ref ModelRoute], !Ref ModelId]]
+                    # a profile may send the call to any Region in its geography
+                    - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${ModelId}"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}"
+      Tags:
+        - Key: chapter
+          Value: session-02
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  AskFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-${Environment}-ask"
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt AskFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          MODEL_ID: !If
+            - CallsInferenceProfile
+            - !Join [".", [!If [RouteIsAuto, !FindInMap [RegionRoute, !Ref "AWS::Region", Route], !Ref ModelRoute], !Ref ModelId]]
+            - !Ref ModelId
+      LoggingConfig:
+        LogGroup: !Ref AskFunctionLogGroup
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          bedrock = boto3.client("bedrock-runtime")
+          MODEL_ID = os.environ["MODEL_ID"]
+          MAX_QUESTION = 1000  # the endpoint is public until sign-in (ch 7); long input costs money
+          SYSTEM_PROMPT = (
+              "You are the IT helpdesk assistant for a company. Answer in at most five short "
+              "steps. If you are not sure, say so and suggest contacting the IT team."
+          )
+
+
+          def reply(status, body):
+              return {
+                  "statusCode": status,
+                  "headers": {"content-type": "application/json"},
+                  "body": json.dumps(body),
+              }
+
+
+          def handler(event, context):
+              try:
+                  question = json.loads(event.get("body") or "{}").get("question")
+              except (ValueError, AttributeError):
+                  question = None
+              if not isinstance(question, str) or not question.strip():
+                  return reply(400, {"error": 'Send JSON like {"question": "..."}'})
+              if len(question) > MAX_QUESTION:
+                  return reply(400, {"error": f"Keep the question under {MAX_QUESTION} characters"})
+
+              try:
+                  response = bedrock.converse(
+                      modelId=MODEL_ID,
+                      system=[{"text": SYSTEM_PROMPT}],
+                      messages=[{"role": "user", "content": [{"text": question}]}],
+                      inferenceConfig={"maxTokens": 400, "temperature": 0.2},
+                  )
+                  answer = response["output"]["message"]["content"][0]["text"]
+              except Exception:
+                  logger.exception("model call failed")
+                  return reply(502, {"error": "The assistant is unavailable. Try again."})
+
+              logger.info("answered a question of %d characters", len(question))
+              return reply(200, {"answer": answer})
+      Tags:
+        - Key: chapter
+          Value: session-02
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  HelpdeskApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${Project}-${Environment}-api"
+      ProtocolType: HTTP
+      Tags:
+        chapter: session-02
+        project: !Ref Project
+        environment: !Ref Environment
+
+  AskIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HelpdeskApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AskFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  AskRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HelpdeskApi
+      RouteKey: POST /ask
+      Target: !Sub "integrations/${AskIntegration}"
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HelpdeskApi
+      StageName: $default
+      AutoDeploy: true
+      # Public until sign-in (ch 7): cap requests so a leaked URL cannot run up the bill
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 1
+      Tags:
+        chapter: session-02
+        project: !Ref Project
+        environment: !Ref Environment
+
+  AskInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AskFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HelpdeskApi}/*/POST/ask"
+
+Outputs:
+  AskUrl:
+    Description: POST a JSON question here.
+    Value: !Sub "${HelpdeskApi.ApiEndpoint}/ask"
+  ModelInUse:
+    Description: The id the function sends to Bedrock, the model id or its inference profile id.
+    Value: !If
+      - CallsInferenceProfile
+      - !Join [".", [!If [RouteIsAuto, !FindInMap [RegionRoute, !Ref "AWS::Region", Route], !Ref ModelRoute], !Ref ModelId]]
+      - !Ref ModelId

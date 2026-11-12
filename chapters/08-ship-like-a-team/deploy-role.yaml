@@ -1,0 +1,530 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Helpdesk assistant, chapter 8 bootstrap. Create this stack once per account, by hand, before the
+  first workflow run. It lets a GitHub Actions workflow deploy the helpdesk without any stored AWS
+  key: it trusts GitHub's OIDC provider, but only for this repository's staging and prod
+  environments. The role the workflow assumes can only run CloudFormation on helpdesk stacks and
+  hand the work to a second role that CloudFormation itself assumes. That second role can create
+  other roles only if they carry a permissions boundary defined here, so a workflow can never
+  mint a role that is stronger than the helpdesk needs. The main template is not in this file:
+  the provider exists once per account, so it cannot sit in both environment stacks.
+Parameters:
+  GitHubSubjectPrefix:
+    Type: String
+    AllowedPattern: "^repo:[A-Za-z0-9._-]+(@[0-9]+)?/[A-Za-z0-9._-]+(@[0-9]+)?$"
+    ConstraintDescription: >-
+      Use repo:OWNER/REPO, or repo:OWNER@OWNER-ID/REPO@REPO-ID if your repository's tokens carry
+      the numeric ids. No wildcard is allowed.
+    Description: >-
+      The start of the subject claim GitHub puts in this repository's tokens. No default; you must
+      pass your own.
+  CreateProvider:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Say false if this account already has the GitHub provider, and pass its ARN below.
+  ExistingProviderArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider/token\\.actions\\.githubusercontent\\.com$"
+    Description: The ARN of the GitHub provider that already exists. Leave empty when CreateProvider is true.
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: chapter
+          Value: session-08
+
+  # The most any role created by a helpdesk stack can ever do. A boundary grants nothing by
+  # itself: a role's real permissions are what its own policy allows AND this policy allows.
+  HelpdeskPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "boundary-helpdesk-${AWS::Region}"
+      Description: The ceiling for every role a helpdesk stack creates.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WriteOwnLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/helpdesk-*:*"
+          - Sid: CallModelsAndTheGuardrail
+            Effect: Allow
+            Action:
+              - bedrock:ApplyGuardrail
+              - bedrock:InvokeModel
+              - bedrock:Retrieve
+            Resource:
+              # A model reached through an inference profile may run in any Region the profile
+              # routes to, so the model is allowed in every Region and the profile in this one.
+              - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+              - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+          - Sid: AskTheKnowledgeBase
+            Effect: Allow
+            Action: bedrock:RetrieveAndGenerate
+            Resource: "*"
+          - Sid: ReadAndWriteTickets
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+            Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/helpdesk-*"
+          - Sid: PublishEscalations
+            Effect: Allow
+            Action: sns:Publish
+            Resource: !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:helpdesk-*"
+          - Sid: ReadThePolicyPages
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::helpdesk-*-site-${AWS::AccountId}-${AWS::Region}"
+              - !Sub "arn:${AWS::Partition}:s3:::helpdesk-*-site-${AWS::AccountId}-${AWS::Region}/*"
+          - Sid: UseTheVectorIndex
+            Effect: Allow
+            Action:
+              - s3vectors:DeleteVectors
+              - s3vectors:GetIndex
+              - s3vectors:GetVectors
+              - s3vectors:PutVectors
+              - s3vectors:QueryVectors
+            Resource: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/*"
+
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # The name must not start with helpdesk-: the patterns below are what this role may manage
+      RoleName: !Sub "cfn-helpdesk-execution-${AWS::Region}"
+      Description: Assumed by CloudFormation, never by a person or a workflow, to create the helpdesk's resources.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: create-the-helpdesk
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Roles: only ones named helpdesk-* that carry the boundary above. There is no
+              # attach-policy action (the stacks use inline policies) and nothing that can add or
+              # remove a boundary, so the ceiling cannot be lifted from here.
+              - Sid: CreateAndChangeRolesOnlyWithTheBoundary
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:UpdateAssumeRolePolicy
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/helpdesk-*"
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref HelpdeskPermissionsBoundary
+              - Sid: ReadTagAndDeleteHelpdeskRoles
+                Effect: Allow
+                Action:
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/helpdesk-*"
+              - Sid: PassHelpdeskRolesToLambdaAndBedrockOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/helpdesk-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - bedrock.amazonaws.com
+              # Every grant below names its actions. A name pattern limits what has a name we
+              # choose (helpdesk-*); a tag condition limits what only has an id the service picks
+              # (the chapter tag, set on every stack resource that takes tags).
+              - Sid: HelpdeskFunctions
+                Effect: Allow
+                Action:
+                  - lambda:AddPermission
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetPolicy
+                  - lambda:ListTags
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:helpdesk-*"
+              - Sid: HelpdeskLogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DeleteRetentionPolicy
+                  - logs:ListTagsForResource
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/helpdesk-*"
+              - Sid: ListLogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: HelpdeskTables
+                Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:UpdateTable
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/helpdesk-*"
+              - Sid: HelpdeskTopics
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetSubscriptionAttributes
+                  - sns:GetTopicAttributes
+                  - sns:ListSubscriptionsByTopic
+                  - sns:ListTagsForResource
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:TagResource
+                  - sns:Unsubscribe
+                  - sns:UntagResource
+                Resource: !Sub "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:helpdesk-*"
+              - Sid: TheSiteBucketsOnly
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketLocation
+                  - s3:GetBucketOwnershipControls
+                  - s3:GetBucketPolicy
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:GetBucketTagging
+                  - s3:GetEncryptionConfiguration
+                  - s3:ListBucket
+                  - s3:PutBucketOwnershipControls
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketTagging
+                  - s3:PutEncryptionConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:s3:::helpdesk-*-site-${AWS::AccountId}-${AWS::Region}"
+              # API Gateway names its actions after the HTTP method, and a resource path limits
+              # them: HTTP APIs and their tags only, not REST APIs, domain names or keys.
+              - Sid: HttpApisInThisRegion
+                Effect: Allow
+                Action:
+                  - apigateway:DELETE
+                  - apigateway:GET
+                  - apigateway:PATCH
+                  - apigateway:POST
+                  - apigateway:PUT
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis"
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*"
+                  - !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*"
+              # Guardrails and knowledge bases get ids. Creating one has no resource to name, so it
+              # is allowed on any resource only when the request carries the chapter tag.
+              - Sid: CreateTaggedBedrockResources
+                Effect: Allow
+                Action:
+                  - bedrock:CreateGuardrail
+                  - bedrock:CreateKnowledgeBase
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/chapter: session-08
+                  ForAllValues:StringLike:
+                    aws:TagKeys:
+                      - chapter
+                      - project
+                      - environment
+                      - aws:cloudformation:*
+              - Sid: ManageBedrockResourcesInThisAccountAndRegion
+                Effect: Allow
+                Action:
+                  - bedrock:CreateDataSource
+                  - bedrock:CreateGuardrailVersion
+                  - bedrock:DeleteDataSource
+                  - bedrock:DeleteGuardrail
+                  - bedrock:DeleteKnowledgeBase
+                  - bedrock:GetDataSource
+                  - bedrock:GetGuardrail
+                  - bedrock:GetKnowledgeBase
+                  - bedrock:ListTagsForResource
+                  - bedrock:UntagResource
+                  - bedrock:UpdateDataSource
+                  - bedrock:UpdateGuardrail
+                  - bedrock:UpdateKnowledgeBase
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/chapter: session-08
+              - Sid: TagBedrockResourcesWithTheChapterTag
+                Effect: Allow
+                Action: bedrock:TagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/chapter: session-08
+                    aws:ResourceTag/chapter: session-08
+                  ForAllValues:StringLike:
+                    aws:TagKeys:
+                      - chapter
+                      - project
+                      - environment
+                      - aws:cloudformation:*
+              - Sid: CreateTaggedVectorBucketsAndIndexes
+                Effect: Allow
+                Action:
+                  - s3vectors:CreateIndex
+                  - s3vectors:CreateVectorBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/chapter: session-08
+                  ForAllValues:StringLike:
+                    aws:TagKeys:
+                      - chapter
+                      - project
+                      - environment
+                      - aws:cloudformation:*
+              # Tagging after creation only touches resources that already carry this chapter's tag,
+              # so the role cannot adopt an untagged resource by stamping the tag onto it.
+              - Sid: TagTaggedVectorBucketsAndIndexes
+                Effect: Allow
+                Action: s3vectors:TagResource
+                Resource: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/chapter: session-08
+                    aws:ResourceTag/chapter: session-08
+                  ForAllValues:StringLike:
+                    aws:TagKeys:
+                      - chapter
+                      - project
+                      - environment
+                      - aws:cloudformation:*
+              - Sid: ManageTaggedVectorBucketsAndIndexes
+                Effect: Allow
+                Action:
+                  - s3vectors:DeleteIndex
+                  - s3vectors:DeleteVectorBucket
+                  - s3vectors:GetIndex
+                  - s3vectors:GetVectorBucket
+                  - s3vectors:ListTagsForResource
+                  - s3vectors:UntagResource
+                Resource: !Sub "arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/chapter: session-08
+              # CloudFront and Cognito: creating one has no name to match, so the request must
+              # carry the chapter tag; everything after that is limited to resources that carry it.
+              # Only the access control cannot be tagged or tag-tested: it is limited to this
+              # account and its own actions.
+              - Sid: CreateTaggedDistributionsAndUserPools
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateDistribution
+                  - cognito-idp:CreateUserPool
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/chapter: session-08
+                  ForAllValues:StringLike:
+                    aws:TagKeys:
+                      - chapter
+                      - project
+                      - environment
+                      - aws:cloudformation:*
+              - Sid: TagDistributionsAndUserPools
+                Effect: Allow
+                Action:
+                  - cloudfront:TagResource
+                  - cognito-idp:TagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*"
+                  - !Sub "arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/chapter: session-08
+                    aws:ResourceTag/chapter: session-08
+                  ForAllValues:StringLike:
+                    aws:TagKeys:
+                      - chapter
+                      - project
+                      - environment
+                      - aws:cloudformation:*
+              - Sid: ManageTaggedDistributions
+                Effect: Allow
+                Action:
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:ListTagsForResource
+                  - cloudfront:UntagResource
+                  - cloudfront:UpdateDistribution
+                Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/chapter: session-08
+              - Sid: ManageTaggedUserPools
+                Effect: Allow
+                Action:
+                  - cognito-idp:CreateGroup
+                  - cognito-idp:CreateUserPoolClient
+                  - cognito-idp:DeleteGroup
+                  - cognito-idp:DeleteUserPool
+                  - cognito-idp:DeleteUserPoolClient
+                  - cognito-idp:DescribeUserPool
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:GetGroup
+                  - cognito-idp:GetUserPoolMfaConfig
+                  - cognito-idp:ListGroups
+                  - cognito-idp:ListTagsForResource
+                  - cognito-idp:ListUserPoolClients
+                  - cognito-idp:UntagResource
+                  - cognito-idp:UpdateGroup
+                  - cognito-idp:UpdateUserPool
+                  - cognito-idp:UpdateUserPoolClient
+                Resource: !Sub "arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/chapter: session-08
+              - Sid: CreateAnOriginAccessControl
+                Effect: Allow
+                Action: cloudfront:CreateOriginAccessControl
+                Resource: "*"
+              - Sid: ManageOriginAccessControlsInThisAccount
+                Effect: Allow
+                Action:
+                  - cloudfront:DeleteOriginAccessControl
+                  - cloudfront:GetOriginAccessControl
+                  - cloudfront:GetOriginAccessControlConfig
+                  - cloudfront:UpdateOriginAccessControl
+                Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:origin-access-control/*"
+              - Sid: ReadTheManagedCloudFrontPolicies
+                Effect: Allow
+                Action:
+                  - cloudfront:GetCachePolicy
+                  - cloudfront:GetOriginRequestPolicy
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:cache-policy/*"
+                  - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:origin-request-policy/*"
+      Tags:
+        - Key: chapter
+          Value: session-08
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "github-helpdesk-deploy-${AWS::Region}"
+      Description: Assumed by the helpdesk workflow through GitHub's OIDC provider. No stored key.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - MakeProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              # AWS offers only aud and sub from a GitHub token as condition keys, so the branch
+              # cannot be named here: each environment's deployment-branch rule (main only) does it.
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Exact match, no wildcard: only a job that names one of these two environments
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "${GitHubSubjectPrefix}:environment:staging"
+                  - !Sub "${GitHubSubjectPrefix}:environment:prod"
+      Policies:
+        - PolicyName: deploy-the-helpdesk
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunCloudFormationOnHelpdeskStacksOnly
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplate
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/helpdesk-*/*"
+              - Sid: ReadATemplateSummary
+                Effect: Allow
+                Action: cloudformation:GetTemplateSummary
+                Resource: "*"
+              - Sid: HandTheWorkToTheCloudFormationRoleOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: PublishThePagesToTheSiteBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::helpdesk-*-site-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:${AWS::Partition}:s3:::helpdesk-*-site-${AWS::AccountId}-${AWS::Region}/*"
+              - Sid: StartAnIngestionJob
+                Effect: Allow
+                Action: bedrock:StartIngestionJob
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Tags:
+        - Key: chapter
+          Value: session-08
+
+Outputs:
+  DeployRoleArn:
+    Description: Save as the repository variable DEPLOY_ROLE_ARN.
+    Value: !GetAtt GitHubDeployRole.Arn
+  CloudFormationRoleArn:
+    Description: Save as the repository variable CFN_ROLE_ARN.
+    Value: !GetAtt CloudFormationExecutionRole.Arn
+  PermissionsBoundaryArn:
+    Description: Save as the repository variable PERMISSIONS_BOUNDARY_ARN.
+    Value: !Ref HelpdeskPermissionsBoundary

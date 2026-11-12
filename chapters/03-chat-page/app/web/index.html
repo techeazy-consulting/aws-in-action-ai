@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IT helpdesk</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+    #log { list-style: none; padding: 0; }
+    #log li { margin: 0.75rem 0; padding: 0.5rem 0.75rem; border-radius: 0.5rem; white-space: pre-wrap; }
+    #log li.you { background: #e8eefc; }
+    #log li.bot { background: #f1f1f1; }
+    #log li.err { background: #fde8e8; }
+    textarea { width: 100%; box-sizing: border-box; font: inherit; }
+    button { margin-top: 0.5rem; font: inherit; }
+  </style>
+</head>
+<body>
+  <h1>IT helpdesk</h1>
+  <ul id="log" aria-live="polite"></ul>
+  <form id="form">
+    <label for="question">Ask a question</label>
+    <textarea id="question" rows="3" maxlength="1000" required></textarea>
+    <button id="send" type="submit">Send</button>
+  </form>
+  <script>
+    // The page and the endpoint share one address: CloudFront sends /ask to the API.
+    // The reply arrives whole, so there is nothing to stream.
+    const log = document.getElementById("log");
+    const form = document.getElementById("form");
+    const box = document.getElementById("question");
+    const send = document.getElementById("send");
+
+    function add(kind, text) {
+      const item = document.createElement("li");
+      item.className = kind;
+      item.textContent = text; // text, never markup: the answer is not trusted
+      log.appendChild(item);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const question = box.value.trim();
+      if (!question) return;
+      add("you", question);
+      box.value = "";
+      send.disabled = true;
+      try {
+        const response = await fetch("/ask", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ question }),
+        });
+        const data = await response.json();
+        if (response.ok) add("bot", data.answer);
+        else add("err", data.error || "Something went wrong. Try again.");
+      } catch (error) {
+        add("err", "Could not reach the helpdesk. Try again.");
+      } finally {
+        send.disabled = false;
+        box.focus();
+      }
+    });
+  </script>
+</body>
+</html>

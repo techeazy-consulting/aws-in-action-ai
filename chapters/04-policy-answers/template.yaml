@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Helpdesk assistant, chapter 4. POST /ask asks a knowledge base built from the IT policy
+  pages and returns a cited answer. The chat page, in a private bucket behind CloudFront, shows
+  the cited page beside the answer.
+Parameters:
+  Project:
+    Type: String
+    Default: helpdesk
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+    Description: Short project name, lowercase. Starts every resource name, for example helpdesk-dev-ask.
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Which copy this stack is. Deploy once per environment, each as its own stack.
+  ModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    AllowedValues:
+      - amazon.nova-lite-v1:0
+      - amazon.nova-micro-v1:0
+    Description: >-
+      The model that answers. Nova Lite works in every Region in the RegionRoute list. Nova Micro has
+      no Asia Pacific route. To switch later, update the stack and pick another value here; editing the
+      function's MODEL_ID alone fails, because the role only allows the model chosen here.
+  ModelRoute:
+    Type: String
+    Default: auto
+    AllowedValues: [auto, direct, us, eu, apac, ca]
+    Description: >-
+      How the call reaches the model. auto picks the route for this Region from RegionRoute. direct
+      calls the model id as it is (only where the model page shows In-Region support); us, eu, apac
+      and ca call that geography's inference profile.
+
+Mappings:
+  # The route each Region uses for Nova Lite, from the model page's Regional availability table.
+  RegionRoute:
+    us-east-1: {Route: us}
+    us-east-2: {Route: us}
+    us-west-1: {Route: us}
+    us-west-2: {Route: us}
+    ca-central-1: {Route: ca}
+    ca-west-1: {Route: ca}
+    eu-central-1: {Route: eu}
+    eu-north-1: {Route: eu}
+    eu-south-1: {Route: eu}
+    eu-south-2: {Route: eu}
+    eu-west-1: {Route: eu}
+    eu-west-2: {Route: direct}
+    eu-west-3: {Route: eu}
+    il-central-1: {Route: eu}
+    ap-northeast-1: {Route: apac}
+    ap-northeast-2: {Route: apac}
+    ap-south-1: {Route: apac}
+    ap-southeast-1: {Route: apac}
+    ap-southeast-2: {Route: apac}
+    ap-southeast-3: {Route: apac}
+    me-central-1: {Route: direct}
+
+Conditions:
+  RouteIsAuto: !Equals [!Ref ModelRoute, auto]
+  CallsModelDirectly: !Or
+    - !Equals [!Ref ModelRoute, direct]
+    - !And
+      - !Condition RouteIsAuto
+      - !Equals [!FindInMap [RegionRoute, !Ref "AWS::Region", Route], direct]
+  CallsInferenceProfile: !Not [!Condition CallsModelDirectly]
+
+Resources:
+  AskFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${Project}-${Environment}-ask"
+      RetentionInDays: 7
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  AskFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ask-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AskFunctionLogGroup.Arn
+              - Sid: CallTheChosenModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !If
+                  - CallsInferenceProfile
+                  - - !Sub
+                      - "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${Id}"
+                      - Id: !Join [".", [!If [RouteIsAuto, !FindInMap [RegionRoute, !Ref "AWS::Region", Route], !Ref ModelRoute], !Ref ModelId]]
+                    # a profile may send the call to any Region in its geography
+                    - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/${ModelId}"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}"
+              - Sid: AskTheKnowledgeBase
+                Effect: Allow
+                Action: bedrock:RetrieveAndGenerate
+                Resource: "*"
+              - Sid: ReadOnlyThisKnowledgeBase
+                Effect: Allow
+                Action: bedrock:Retrieve
+                Resource: !GetAtt PolicyKnowledgeBase.KnowledgeBaseArn
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  AskFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Project}-${Environment}-ask"
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt AskFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !Ref PolicyKnowledgeBase
+          MODEL_ARN: !If
+            - CallsInferenceProfile
+            - !Sub
+              - "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${Id}"
+              - Id: !Join [".", [!If [RouteIsAuto, !FindInMap [RegionRoute, !Ref "AWS::Region", Route], !Ref ModelRoute], !Ref ModelId]]
+            - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}"
+      LoggingConfig:
+        LogGroup: !Ref AskFunctionLogGroup
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import re
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          agent = boto3.client("bedrock-agent-runtime")
+          KNOWLEDGE_BASE_ID = os.environ["KNOWLEDGE_BASE_ID"]
+          MODEL_ARN = os.environ["MODEL_ARN"]
+          MAX_QUESTION = 1000  # the endpoint is public until sign-in (ch 7); long input costs money
+          MAX_EXCERPT = 300
+          # Only pages from the policy folder are passed to the browser, whatever the knowledge base returns.
+          PAGE_KEY = re.compile(r"^policies/[A-Za-z0-9._-]+\.html$")
+
+
+          def reply(status, body):
+              return {
+                  "statusCode": status,
+                  "headers": {"content-type": "application/json"},
+                  "body": json.dumps(body),
+              }
+
+
+          def sources(citations):
+              """The distinct policy pages behind an answer, each with the passage that was used."""
+              found = {}
+              for citation in citations:
+                  for reference in citation.get("retrievedReferences", []):
+                      uri = ((reference.get("location") or {}).get("s3Location") or {}).get("uri") or ""
+                      parts = uri.split("/", 3)
+                      key = parts[3] if uri.startswith("s3://") and len(parts) == 4 else ""
+                      if PAGE_KEY.match(key) and key not in found:
+                          text = (reference.get("content") or {}).get("text") or ""
+                          found[key] = {"page": key, "excerpt": text[:MAX_EXCERPT]}
+              return list(found.values())
+
+
+          def handler(event, context):
+              try:
+                  question = json.loads(event.get("body") or "{}").get("question")
+              except (ValueError, AttributeError):
+                  question = None
+              if not isinstance(question, str) or not question.strip():
+                  return reply(400, {"error": 'Send JSON like {"question": "..."}'})
+              if len(question) > MAX_QUESTION:
+                  return reply(400, {"error": f"Keep the question under {MAX_QUESTION} characters"})
+
+              try:
+                  response = agent.retrieve_and_generate(
+                      input={"text": question},
+                      retrieveAndGenerateConfiguration={
+                          "type": "KNOWLEDGE_BASE",
+                          "knowledgeBaseConfiguration": {
+                              "knowledgeBaseId": KNOWLEDGE_BASE_ID,
+                              "modelArn": MODEL_ARN,
+                              "generationConfiguration": {
+                                  "inferenceConfig": {
+                                      "textInferenceConfig": {"maxTokens": 400, "temperature": 0.2}
+                                  }
+                              },
+                          },
+                      },
+                  )
+                  answer = response["output"]["text"]
+                  cited = sources(response.get("citations", []))
+              except Exception:
+                  logger.exception("knowledge base call failed")
+                  return reply(502, {"error": "The assistant is unavailable. Try again."})
+
+              logger.info("answered a question of %d characters from %d pages", len(question), len(cited))
+              return reply(200, {"answer": answer, "sources": cited})
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  HelpdeskApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${Project}-${Environment}-api"
+      ProtocolType: HTTP
+      Tags:
+        chapter: session-04
+        project: !Ref Project
+        environment: !Ref Environment
+
+  AskIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HelpdeskApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AskFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  AskRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HelpdeskApi
+      RouteKey: POST /ask
+      Target: !Sub "integrations/${AskIntegration}"
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HelpdeskApi
+      StageName: $default
+      AutoDeploy: true
+      # Public until sign-in (ch 7): cap requests so a leaked URL cannot run up the bill
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 1
+      Tags:
+        chapter: session-04
+        project: !Ref Project
+        environment: !Ref Environment
+
+  AskInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AskFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HelpdeskApi}/*/POST/ask"
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${Project}-${Environment}-site"
+        Description: Signs CloudFront requests to the private site bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Helpdesk chat page and /ask
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api
+            DomainName: !Sub "${HelpdeskApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          # CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CacheBehaviors:
+          - PathPattern: /ask
+            TargetOriginId: api
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+            # CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # AllViewerExceptHostHeader: the API expects its own host name, not CloudFront's
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  PolicyVectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  PolicyVectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt PolicyVectorBucket.VectorBucketArn
+      DataType: float32
+      # The default output size of the embedding model named by PolicyKnowledgeBase
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_TEXT
+          - AMAZON_BEDROCK_METADATA
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Policies:
+        - PolicyName: knowledge-base-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EmbedWithTheChosenModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+              - Sid: ListThePolicyBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt SiteBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: ReadThePolicyPages
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${SiteBucket.Arn}/policies/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: UseTheVectorIndex
+                Effect: Allow
+                Action:
+                  - s3vectors:PutVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:GetIndex
+                Resource: !GetAtt PolicyVectorIndex.IndexArn
+      Tags:
+        - Key: chapter
+          Value: session-04
+        - Key: project
+          Value: !Ref Project
+        - Key: environment
+          Value: !Ref Environment
+
+  PolicyKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub "${Project}-${Environment}-policies"
+      Description: IT policy pages
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt PolicyVectorIndex.IndexArn
+      Tags:
+        chapter: session-04
+        project: !Ref Project
+        environment: !Ref Environment
+
+  PolicyDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref PolicyKnowledgeBase
+      Name: !Sub "${Project}-${Environment}-policy-pages"
+      # Delete the vectors with the data source, so the vector bucket is empty when the stack goes
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt SiteBucket.Arn
+          InclusionPrefixes:
+            - policies/
+
+Outputs:
+  AskUrl:
+    Description: POST a JSON question here.
+    Value: !Sub "${HelpdeskApi.ApiEndpoint}/ask"
+  ChatUrl:
+    Description: Open this address to use the chat page.
+    Value: !Sub "https://${SiteDistribution.DomainName}"
+  SiteBucketName:
+    Description: Upload app/web/index.html here.
+    Value: !Ref SiteBucket
+  KnowledgeBaseId:
+    Description: The knowledge base the function asks.
+    Value: !Ref PolicyKnowledgeBase
+  DataSourceId:
+    Description: Start an ingestion job for this data source after uploading policy pages.
+    Value: !GetAtt PolicyDataSource.DataSourceId
+  ModelInUse:
+    Description: The id the function sends to Bedrock, the model id or its inference profile id.
+    Value: !If
+      - CallsInferenceProfile
+      - !Join [".", [!If [RouteIsAuto, !FindInMap [RegionRoute, !Ref "AWS::Region", Route], !Ref ModelRoute], !Ref ModelId]]
+      - !Ref ModelId

@@ -1,0 +1,112 @@
+name: helpdesk
+
+# Every push to main and every pull request runs the tests and the template check.
+# After each deploy a quality check asks a fixed list of questions and fails on a wrong answer, so
+# a bad staging deploy never reaches the prod approval.
+# Only the main branch goes on: to staging, then to prod after a person approves the prod environment.
+# No AWS key is stored anywhere: each deploy job trades GitHub's short-lived token for a role.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# The default for every job: read the code, nothing else. The deploy jobs ask for more below.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the tools
+        run: pip install pytest cfn-lint boto3 pyyaml
+      - name: Run the tests
+        run: pytest -q
+      - name: Check the templates
+        run: cfn-lint template.yaml deploy-role.yaml
+
+  deploy-staging:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency: deploy-staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENVIRONMENT: staging
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+      ESCALATION_EMAIL: ${{ vars.ESCALATION_EMAIL }}
+      PERMISSIONS_BOUNDARY_ARN: ${{ vars.PERMISSIONS_BOUNDARY_ARN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install boto3 for the quality check
+        run: pip install boto3
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy the stack
+        run: |
+          aws cloudformation deploy --stack-name "helpdesk-$ENVIRONMENT" --template-file template.yaml --capabilities CAPABILITY_IAM --role-arn "$CFN_ROLE_ARN" --no-fail-on-empty-changeset --parameter-overrides "Environment=$ENVIRONMENT" "EscalationEmail=$ESCALATION_EMAIL" "PermissionsBoundaryArn=$PERMISSIONS_BOUNDARY_ARN"
+      - name: Publish the chat page and the policy pages
+        run: |
+          output() { aws cloudformation describe-stacks --stack-name "helpdesk-$ENVIRONMENT" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          BUCKET=$(output SiteBucketName)
+          aws s3 cp app/web/index.html "s3://$BUCKET/index.html" --content-type text/html
+          aws s3 cp app/policies "s3://$BUCKET/policies" --recursive --content-type text/html
+          JOB=$(aws bedrock-agent start-ingestion-job --knowledge-base-id "$(output KnowledgeBaseId)" --data-source-id "$(output DataSourceId)" --query ingestionJob.ingestionJobId --output text)
+          python app/quality/check.py wait --knowledge-base-id "$(output KnowledgeBaseId)" --data-source-id "$(output DataSourceId)" --job-id "$JOB"
+      - name: Quality check
+        run: python app/quality/check.py run --function-name "helpdesk-$ENVIRONMENT-ask"
+
+  deploy-prod:
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency: deploy-prod
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENVIRONMENT: prod
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+      ESCALATION_EMAIL: ${{ vars.ESCALATION_EMAIL }}
+      PERMISSIONS_BOUNDARY_ARN: ${{ vars.PERMISSIONS_BOUNDARY_ARN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install boto3 for the quality check
+        run: pip install boto3
+      - uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy the stack
+        run: |
+          aws cloudformation deploy --stack-name "helpdesk-$ENVIRONMENT" --template-file template.yaml --capabilities CAPABILITY_IAM --role-arn "$CFN_ROLE_ARN" --no-fail-on-empty-changeset --parameter-overrides "Environment=$ENVIRONMENT" "EscalationEmail=$ESCALATION_EMAIL" "PermissionsBoundaryArn=$PERMISSIONS_BOUNDARY_ARN"
+      - name: Publish the chat page and the policy pages
+        run: |
+          output() { aws cloudformation describe-stacks --stack-name "helpdesk-$ENVIRONMENT" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          BUCKET=$(output SiteBucketName)
+          aws s3 cp app/web/index.html "s3://$BUCKET/index.html" --content-type text/html
+          aws s3 cp app/policies "s3://$BUCKET/policies" --recursive --content-type text/html
+          JOB=$(aws bedrock-agent start-ingestion-job --knowledge-base-id "$(output KnowledgeBaseId)" --data-source-id "$(output DataSourceId)" --query ingestionJob.ingestionJobId --output text)
+          python app/quality/check.py wait --knowledge-base-id "$(output KnowledgeBaseId)" --data-source-id "$(output DataSourceId)" --job-id "$JOB"
+      - name: Quality check
+        run: python app/quality/check.py run --function-name "helpdesk-$ENVIRONMENT-ask"

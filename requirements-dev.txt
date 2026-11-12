@@ -1,0 +1,4 @@
+pytest
+cfn-lint
+boto3
+pyyaml
